@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 set -euo pipefail
 exec </dev/tty   # ensure we can read from your terminal
 
