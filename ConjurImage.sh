@@ -1,51 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ensure reads come from your TTY (even under sudo)
+# Ensure reads come from your TTY even under sudo
 exec </dev/tty
 
 echo "=== Conjur Rootless Podman Setup ==="
 
-# 1) Ask for the role
+# 1) Prompt for Conjur role
 read -rp "1) Role (leader | standby | follower): " ROLE
 if [[ ! "$ROLE" =~ ^(leader|standby|follower)$ ]]; then
   echo "❌ Invalid role. Must be: leader, standby or follower."
   exit 1
 fi
 
-# 2) Derive current user
-USERNAME=$(whoami)
-echo "→ Running as user: $USERNAME (will be your rootless Podman user)"
+# 2) Use current user as rootless Podman user
+USERNAME="$(whoami)"
+echo "→ Running as user: $USERNAME"
 
-# 3) Defaults (no proxy)
-IMAGE_PREFIX="registry.tld/conjur-appliance"
+# 3) Auto-discover the latest appliance tarball and version
 IMAGE_TAR=$(ls conjur-appliance-*.tar.gz 2>/dev/null | sort -V | tail -n1)
 if [[ -z "$IMAGE_TAR" ]]; then
   echo "❌ No conjur-appliance-*.tar.gz found in $(pwd)."
   exit 1
 fi
-VERSION=${IMAGE_TAR#conjur-appliance-}
-VERSION=${VERSION%.tar.gz}
-HOSTFQDN=$(hostname -f)
+VERSION="${IMAGE_TAR#conjur-appliance-}"
+VERSION="${VERSION%.tar.gz}"
+IMAGE_PREFIX="registry.tld/conjur-appliance"
+HOSTFQDN="$(hostname -f)"
 
 echo
 echo "Configuration:"
 echo "  ROLE         = $ROLE"
 echo "  USERNAME     = $USERNAME"
-echo "  IMAGE_PREFIX = $IMAGE_PREFIX"
 echo "  IMAGE_TAR    = $IMAGE_TAR"
 echo "  VERSION      = $VERSION"
+echo "  IMAGE_REF    = ${IMAGE_PREFIX}:${VERSION}"
 echo "  HOST FQDN    = $HOSTFQDN"
 echo
 
-# 4) Make sure Podman is available
-if ! command -v podman &>/dev/null; then
-  echo "❌ podman not found. Install Podman first."
-  exit 1
+read -rp "Proceed with these settings? [Y/n]: " CONFIRM
+if [[ "$CONFIRM" =~ ^[Nn]$ ]]; then
+  echo "Aborted."
+  exit 0
 fi
 
-# 5) Step 2: sysctl tweaks for rootless ports & namespaces
-echo "→ Configuring sysctl for rootless Podman via sudo…"
+# 4) Prime sudo credentials once
+echo
+echo "🔐 You may be prompted for your sudo password below."
+sudo -v
+
+# 5) Step 2: sysctl tweaks for rootless Podman
+echo "→ Configuring /etc/sysctl.d/conjur.conf"
 sudo tee /etc/sysctl.d/conjur.conf >/dev/null <<EOF
 # Allow low port numbers for rootless Podman
 net.ipv4.ip_unprivileged_port_start=443
@@ -54,25 +59,25 @@ user.max_user_namespaces=28633
 EOF
 sudo sysctl -p /etc/sysctl.d/conjur.conf
 
-# 6) Step 4: create Conjur folders under /opt and chown to you
-echo "→ Creating /opt/cyberark/conjur folders via sudo…"
+# 6) Step 4: Create /opt/cyberark/conjur folders & chown to you
+echo "→ Creating Conjur directories under /opt"
 for D in security config backups seeds logs; do
-  sudo mkdir -p /opt/cyberark/conjur/$D
-  sudo chown "$USERNAME":"$USERNAME" /opt/cyberark/conjur/$D
+  sudo mkdir -p /opt/cyberark/conjur/"$D"
+  sudo chown "$USERNAME":"$USERNAME" /opt/cyberark/conjur/"$D"
 done
 
-# 7) Step 5: create empty conjur.yml as your user
-echo "→ Touching conjur.yml (so Podman can mount it)…"
+# 7) Step 5: Touch conjur.yml and fix perms
+echo "→ Preparing conjur.yml"
 sudo -u "$USERNAME" touch /opt/cyberark/conjur/config/conjur.yml
 sudo chmod o+x /opt/cyberark/conjur/config
 sudo chmod o+r /opt/cyberark/conjur/config/conjur.yml
 
-# 8) Step 6: load the image into your rootless Podman
-echo "→ Loading Conjur image into rootless Podman…"
+# 8) Step 6: Load the Conjur appliance image into rootless Podman
+echo "→ Loading Conjur image ($IMAGE_TAR)"
 podman load -i "$IMAGE_TAR"
 
-# 9) Step 10: build common podman run options
-echo "→ Starting Conjur ($ROLE) container via rootless Podman…"
+# 9) Step 10: Run the Conjur container in rootless Podman
+echo "→ Starting Conjur container (role=$ROLE)"
 IMG_REF="${IMAGE_PREFIX}:${VERSION}"
 COMMON_OPTS=(
   --name "conjur-${ROLE}"
@@ -96,21 +101,19 @@ fi
 
 podman run "${COMMON_OPTS[@]}" "$IMG_REF"
 
-# 10) Step 11: generate & enable your per-user systemd service
-echo "→ Generating systemd service (user) for Podman auto-start…"
-USER_HOME=$(eval echo "~$USERNAME")
+# 10) Step 11: Generate & enable systemd user service
+echo "→ Generating systemd unit for ${USERNAME}"
+USER_HOME="$(eval echo "~$USERNAME")"
 mkdir -p "$USER_HOME/.config/systemd/user"
 podman generate systemd "conjur-${ROLE}" \
   --name --container-prefix="" --separator="" \
   > "$USER_HOME/.config/systemd/user/conjur.service"
-
-echo "→ Enabling systemd user service…"
 su - "$USERNAME" -c "systemctl --user daemon-reload && systemctl --user enable conjur.service"
 
-# 11) Step 12: enable linger so the Podman service survives logout
-echo "→ Enabling linger for user $USERNAME…"
+# 11) Step 12: Enable linger so your service survives logout
+echo "→ Enabling linger for user $USERNAME"
 loginctl enable-linger "$USERNAME"
 
 echo
-echo "✅  Conjur ${ROLE^} ('conjur-${ROLE}') is now running under rootless Podman."
-echo "    You can check with: podman ps"
+echo "✅ Conjur ${ROLE^} ('conjur-${ROLE}') is running under rootless Podman."
+echo "   Check with: podman ps"
