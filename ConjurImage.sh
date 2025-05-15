@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+exec </dev/tty
 
 echo "=== Conjur Rootless Podman Setup ==="
 echo "You'll be prompted only for the role and rootless username."
