@@ -1,54 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec </dev/tty    # ensure reads come from your terminal
+exec </dev/tty    # make sure read prompts come from your terminal
 
-# —— configuration ——  
+# ↓↓↓ Edit only these if you need to change defaults ↓↓↓
 CONJUR_USER="thomas"
 IMAGE_PREFIX="registry.tld/conjur-appliance"
-# ————————————
+# ↑↑↑ end editable section ↑↑↑
 
-# If not invoked for user‐phase, do root prep
-if [[ "${1-}" != "user-phase" ]]; then
-  # 1) Elevate to root if needed
-  if [[ "$(id -u)" -ne 0 ]]; then
+# Determine which stage we’re in (default “init”)
+STAGE="${STAGE:-init}"
+
+if [[ "$STAGE" != "user" ]]; then
+  # ─────────────────────────────────────────────────────────────
+  # ROOT PHASE: run as root to configure sysctl & /opt folders
+  # ─────────────────────────────────────────────────────────────
+  if [[ $EUID -ne 0 ]]; then
     echo "🔐 Elevating to root for system prep…"
-    exec sudo bash "$0"
+    # re-exec under sudo, preserving STAGE=init
+    exec sudo env STAGE=init bash "$0"
   fi
 
   echo "✔ Running as root: configuring sysctl & directories…"
 
-  # 2) sysctl tweaks
-  cat > /etc/sysctl.d/conjur.conf <<EOF
+  # Step 2: sysctl tweaks for rootless Podman
+  cat >/etc/sysctl.d/conjur.conf <<EOF
 net.ipv4.ip_unprivileged_port_start=443
 user.max_user_namespaces=28633
 EOF
   sysctl -p /etc/sysctl.d/conjur.conf
 
-  # 3) Create /opt folders and chown
+  # Step 4: create /opt/cyberark/conjur folders and chown to $CONJUR_USER
   for d in security config backups seeds logs; do
     mkdir -p /opt/cyberark/conjur/"$d"
     chown "$CONJUR_USER":"$CONJUR_USER" /opt/cyberark/conjur/"$d"
   done
 
-  echo "✔ System‐level prep done. Switching to $CONJUR_USER for Podman steps…"
-  exec sudo -u "$CONJUR_USER" bash "$0" user-phase
+  echo "✔ System‐level prep done. Dropping to $CONJUR_USER for Podman steps…"
+
+  # re-exec under the unprivileged user with STAGE=user
+  exec sudo -u "$CONJUR_USER" env STAGE=user bash "$0"
 fi
 
-# ———————— user-phase (now running as $CONJUR_USER) ————————
+# ─────────────────────────────────────────────────────────────
+# USER PHASE: now running as $CONJUR_USER, STAGE=user
+# ─────────────────────────────────────────────────────────────
+
 echo "👤 Running as user: $(whoami) — starting rootless Podman deployment…"
 
-# 4) Discover image tarball & version
+# Step 6: find the appliance tarball and derive version
 IMAGE_TAR=$(ls conjur-appliance-*.tar.gz 2>/dev/null | sort -V | tail -n1)
 if [[ -z "$IMAGE_TAR" ]]; then
   echo "❌ No conjur-appliance-*.tar.gz found in $(pwd). Exiting." >&2
   exit 1
 fi
-VERSION=${IMAGE_TAR#conjur-appliance-}
-VERSION=${VERSION%.tar.gz}
+VERSION="${IMAGE_TAR#conjur-appliance-}"
+VERSION="${VERSION%.tar.gz}"
 IMAGE_REF="${IMAGE_PREFIX}:${VERSION}"
 HOSTFQDN=$(hostname -f)
 
-# 5) Prompt for Conjur role
+# Step 5: ask for your role
 read -rp "Conjur role (leader | standby | follower): " ROLE
 if [[ ! "$ROLE" =~ ^(leader|standby|follower)$ ]]; then
   echo "❌ Invalid role. Must be leader, standby, or follower." >&2
@@ -56,7 +66,7 @@ if [[ ! "$ROLE" =~ ^(leader|standby|follower)$ ]]; then
 fi
 
 echo
-echo "→ Loading container image ($IMAGE_TAR)…"
+echo "→ Loading Conjur image ($IMAGE_TAR) into rootless Podman…"
 podman load -i "$IMAGE_TAR"
 
 echo "→ Starting Conjur container as '$ROLE'…"
@@ -73,25 +83,23 @@ COMMON_OPTS=(
   --volume /opt/cyberark/conjur/security:/opt/cyberark/conjur/security:z
   --volume /opt/cyberark/conjur/logs:/var/log/conjur:z
 )
-# extra for leader/standby
 if [[ "$ROLE" =~ ^(leader|standby)$ ]]; then
   COMMON_OPTS+=(--publish 5432:5432 --publish 1999:1999)
 fi
-# backup volume only for leader
 if [[ "$ROLE" == "leader" ]]; then
   COMMON_OPTS+=(--volume /opt/cyberark/conjur/backups:/opt/conjur/backup:z)
 fi
 
 podman run "${COMMON_OPTS[@]}" "$IMAGE_REF"
 
-echo "→ Generating systemd user service…"
+echo "→ Generating systemd user service for Podman auto-start…"
 USER_HOME=$(eval echo "~$(whoami)")
 mkdir -p "$USER_HOME/.config/systemd/user"
 podman generate systemd "conjur-${ROLE}" \
   --name --container-prefix="" --separator="" \
   > "$USER_HOME/.config/systemd/user/conjur.service"
 
-echo "→ Enabling systemd user service and linger…"
+echo "→ Enabling the systemd user service and linger…"
 systemctl --user daemon-reload
 systemctl --user enable conjur.service
 loginctl enable-linger "$(whoami)"
