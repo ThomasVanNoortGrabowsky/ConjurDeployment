@@ -19,45 +19,64 @@ if [[ ! "$ROLE" =~ ^(leader|standby|follower)$ ]]; then
   exit 1
 fi
 
-# 3) Find the Conjur appliance tarball
-IMAGE_TAR=$(ls conjur-appliance-*.tar.gz 2>/dev/null | sort -V | tail -n1)
-if [[ -z "$IMAGE_TAR" ]]; then
-  echo "No conjur-appliance-*.tar.gz found in $WORKDIR"
+# 3) Unzip the Conjur appliance image from the VMware shared folder
+ZIP_PATH="/mnt/hgfs/File_Sharing/Conjur Enterprise_13.6_1747379609528.zip"
+if [[ ! -f "$ZIP_PATH" ]]; then
+  echo "ERROR: ZIP file not found at $ZIP_PATH"
   exit 1
 fi
-VERSION=${IMAGE_TAR#conjur-appliance-}
+echo "→ Unzipping Conjur appliance image from shared folder…"
+unzip -o "$ZIP_PATH" -d "$WORKDIR"
+
+# 4) Find the extracted TAR.GZ
+IMAGE_TAR=$(ls "$WORKDIR"/conjur-appliance-*.tar.gz 2>/dev/null | sort -V | tail -n1 || true)
+if [[ -z "$IMAGE_TAR" ]]; then
+  echo "No conjur-appliance-*.tar.gz found in $WORKDIR after unzip"
+  exit 1
+fi
+VERSION=${IMAGE_TAR##*/conjur-appliance-}
 VERSION=${VERSION%.tar.gz}
 IMAGE_REF="registry.tld/conjur-appliance:${VERSION}"
 HOSTFQDN=$(hostname -f)
 
 echo
-echo "→ SYSCTL & /OPT prep (as root)…"
-
-# 4) Enable low ports & increase user namespaces for rootless Podman
+echo "→ STEP 2: Enable low ports & increase user namespaces…"
 cat >/etc/sysctl.d/conjur.conf <<EOF
+# Allow low port number for rootless Podman:
 net.ipv4.ip_unprivileged_port_start=443
+# Increase max user namespaces:
 user.max_user_namespaces=28633
 EOF
 sysctl -p /etc/sysctl.d/conjur.conf
 
-# 5) Create mount dirs under /opt and chown to your user
+echo
+echo "→ STEP 3 & 4: Create rootless user (if needed) and system folders…"
+# (Assumes $ORIG_USER already exists and meets Podman UID/GID requirements)
 for d in security config backups seeds logs; do
   mkdir -p /opt/cyberark/conjur/"$d"
   chown "$ORIG_USER":"$ORIG_USER" /opt/cyberark/conjur/"$d"
 done
 
-echo "✔ System prep done. Now running rootless Podman as $ORIG_USER…"
+echo
+echo "→ STEP 5: Create empty conjur.yml and set permissions…"
+touch /opt/cyberark/conjur/config/conjur.yml
+chmod o+x /opt/cyberark/conjur/config
+chmod o+r /opt/cyberark/conjur/config/conjur.yml
+chown "$ORIG_USER":"$ORIG_USER" /opt/cyberark/conjur/config/conjur.yml
+
+echo
+echo "✔ System prep complete. Now running rootless Podman as $ORIG_USER…"
 echo
 
 # 6) Switch to your user for the Podman steps
 su - "$ORIG_USER" -c "bash -eux <<'EOF'
 cd \"$WORKDIR\"
 
-# Load the image
-echo '→ Loading image: $IMAGE_TAR'
+# STEP 6: Load the image
+echo '→ Loading image: ${IMAGE_TAR##*/}'
 podman load -i \"$IMAGE_TAR\"
 
-# Build run options
+# STEP 7 & 10: Build run options and start Conjur
 COMMON_OPTS=(
   --name \"conjur-$ROLE\"
   --hostname \"$HOSTFQDN\"
@@ -72,12 +91,10 @@ COMMON_OPTS=(
   --volume /opt/cyberark/conjur/logs:/var/log/conjur:z
 )
 
-# extra ports for leader/standby
 if [[ \"$ROLE\" =~ ^(leader|standby)\$ ]]; then
   COMMON_OPTS+=(--publish 5432:5432 --publish 1999:1999)
 fi
 
-# backup volume only for leader
 if [[ \"$ROLE\" == \"leader\" ]]; then
   COMMON_OPTS+=(--volume /opt/cyberark/conjur/backups:/opt/conjur/backup:z)
 fi
@@ -85,19 +102,20 @@ fi
 echo '→ Starting Conjur container'
 podman run \"\${COMMON_OPTS[@]}\" \"$IMAGE_REF\"
 
-# systemd user unit
+# STEP 11: Generate and enable systemd user service
 echo '→ Generating systemd user service'
-mkdir -p \"$HOME/.config/systemd/user\"
+mkdir -p \"\$HOME/.config/systemd/user\"
 podman generate systemd \"conjur-$ROLE\" --name --container-prefix='' --separator='' \
-  > \"$HOME/.config/systemd/user/conjur.service\"
-
-echo '→ Enabling systemd user service & linger'
+  > \"\$HOME/.config/systemd/user/conjur.service\"
 systemctl --user daemon-reload
 systemctl --user enable conjur.service
+
+# STEP 12: Persist user processes after logout
 loginctl enable-linger \"$ORIG_USER\"
 
 echo
 echo '✅ Conjur $ROLE is now running under rootless Podman!'
 EOF"
 
-echo "All done. You can verify with: podman ps"
+echo
+echo "All done. Verify with: podman ps"
