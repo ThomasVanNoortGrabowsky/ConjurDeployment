@@ -1,70 +1,156 @@
 #!/usr/bin/env bash
-# deploy-conjur.sh  —  find, load, and start Conjur appliance
+# deploy-conjur.sh — end-to-end rootless Podman deployment of Conjur Enterprise
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# 1) Where your .tar.gz lives (with spaces handled)
-DEPLOY_DIR="$HOME/ConjurDeployment/Conjur Enterprise/Conjur Enterprise Alliance"
+########################################
+# 1) Define paths & filenames
+########################################
 
-# 2) Path to your Docker Compose file (adjust if needed)
-COMPOSE_FILE="./docker-compose.yml"
+# ZIP on VMware shared folder (spaces handled)
+SHARED_ZIP="/mnt/hgfs/File_Sharing/Conjur Enterprise_13.6_17.474379609528.zip"
 
-# 3) Ensure workspace
-echo "==> Checking deployment directory"
-if [[ ! -d "$DEPLOY_DIR" ]]; then
-  echo "Error: directory not found: $DEPLOY_DIR" >&2
-  exit 1
-fi
+# Where to unpack and build the appliance
+DEPLOY_DIR="$HOME/ConjurDeployment/Conjur Enterprise/Conjur Enterprise Appliance"
 
-# 4) Find the newest appliance tarball
-echo "==> Locating conjur-appliance-*.tar.gz in:"
+# Name of the rootless user to run Podman
+CONJUR_USER="${CONJUR_USER:-conjurless}"
+
+# Version tag (optional override)
+IMAGE_TAG="${IMAGE_TAG:-v13.6.0}"
+
+########################################
+# 2) Unzip the appliance
+########################################
+
+echo "==> Unpacking appliance ZIP to:"
 echo "    $DEPLOY_DIR"
-TARBALL=$(find "$DEPLOY_DIR" -maxdepth 1 -type f -name 'conjur-appliance-*.tar.gz' \
-           | sort \
-           | tail -n1 || true)
+mkdir -p "$DEPLOY_DIR"
+unzip -o "$SHARED_ZIP" -d "$DEPLOY_DIR"
 
-if [[ -z "$TARBALL" ]]; then
-  echo "Error: no conjur-appliance-*.tar.gz found in $DEPLOY_DIR" >&2
-  exit 1
+########################################
+# 3) Sysctl tuning for rootless Podman
+########################################
+
+echo "==> Writing /etc/sysctl.d/conjur.conf"
+sudo tee /etc/sysctl.d/conjur.conf > /dev/null <<EOF
+# Allow low port numbers for rootless Podman
+net.ipv4.ip_unprivileged_port_start=443
+# Increase max user namespaces
+user.max_user_namespaces=28633
+EOF
+
+echo "==> Reloading sysctl settings"
+sudo sysctl -p /etc/sysctl.d/conjur.conf
+
+########################################
+# 4) Create rootless user if needed
+########################################
+
+if ! id "$CONJUR_USER" &>/dev/null; then
+  echo "==> Creating rootless user: $CONJUR_USER"
+  sudo useradd -m -r -s /usr/sbin/nologin "$CONJUR_USER"
 fi
-echo "==> Using appliance tarball: $TARBALL"
 
-# 5) Load the appliance into Docker
-if [[ -x "./_load_conjur_tarfile.sh" ]]; then
-  echo "==> Running local loader script: ./_load_conjur_tarfile.sh \"$TARBALL\""
-  exec ./_load_conjur_tarfile.sh "$TARBALL"
+########################################
+# 5) Prepare Conjur host folders
+########################################
+
+echo "==> Creating Conjur directories under /opt/cyberark/conjur"
+sudo mkdir -p /opt/cyberark/conjur/{security,config,backups,seeds,logs}
+sudo chown -R "$CONJUR_USER":"$CONJUR_USER" /opt/cyberark/conjur
+
+########################################
+# 6) Create conjur.yml and set perms
+########################################
+
+echo "==> Touching conjur.yml and setting permissions"
+sudo -u "$CONJUR_USER" touch /opt/cyberark/conjur/config/conjur.yml
+sudo chmod o+x /opt/cyberark/conjur/config
+sudo chmod o+r /opt/cyberark/conjur/config/conjur.yml
+
+########################################
+# 7) Place seccomp.json (if provided)
+########################################
+
+# If your ZIP contained a seccomp.json, copy it:
+if [[ -f "$DEPLOY_DIR/security/seccomp.json" ]]; then
+  echo "==> Installing seccomp.json"
+  sudo install -m 0644 "$DEPLOY_DIR/security/seccomp.json" /opt/cyberark/conjur/security/seccomp.json
 else
-  echo "==> No loader script found; falling back to 'docker load'"
-  docker load -i "$TARBALL"
+  echo "Warning: no seccomp.json found in ZIP — please add /opt/cyberark/conjur/security/seccomp.json manually"
 fi
 
-# 6) Bring up Conjur via Docker Compose
-echo "==> Starting Conjur services with Docker Compose"
-if [[ ! -f "$COMPOSE_FILE" ]]; then
-  echo "Error: Compose file not found at $COMPOSE_FILE" >&2
+########################################
+# 8) Build the appliance tarball
+########################################
+
+echo "==> Running your tar-creation script in $DEPLOY_DIR"
+pushd "$DEPLOY_DIR" >/dev/null
+BUILD_SCRIPT=$(find . -maxdepth 1 -type f -executable -name '*tar*.sh' | head -n1 || true)
+if [[ -n "$BUILD_SCRIPT" ]]; then
+  echo "→ $BUILD_SCRIPT"
+  ./"$BUILD_SCRIPT"
+else
+  echo "Error: no '*tar*.sh' script found in $DEPLOY_DIR" >&2
   exit 1
 fi
-docker-compose -f "$COMPOSE_FILE" up -d
 
-# 7) Wait for Conjur API to be healthy
-echo -n "==> Waiting for Conjur to become healthy"
-RETRIES=30
-until docker-compose -f "$COMPOSE_FILE" exec -T conjur-api conjur health 2>/dev/null | grep -q 'OK'; do
-  ((RETRIES--)) || { echo; echo "Error: Conjur API failed to become healthy" >&2; exit 1; }
-  echo -n "."
-  sleep 5
-done
-echo " OK"
+echo "==> Locating conjur-appliance-*.tar.gz"
+TARBALL=$(find . -maxdepth 1 -type f -name 'conjur-appliance-*.tar.gz' | sort | tail -n1 || true)
+if [[ -z "$TARBALL" ]]; then
+  echo "Error: tarball not found after build" >&2
+  exit 1
+fi
+TARBALL_PATH="$DEPLOY_DIR/$TARBALL"
+popd >/dev/null
 
-# 8) Print connection details
-CONJUR_URL="https://$(docker-compose -f "$COMPOSE_FILE" port conjur-api 443 | awk -F: '{print $1}')"
+########################################
+# 9) Load the image into Podman
+########################################
+
+echo "==> Loading appliance image into Podman"
+sudo -u "$CONJUR_USER" podman load -i "$TARBALL_PATH"
+
+########################################
+# 10) Run the Conjur Leader container
+########################################
+
+echo "==> Starting Conjur Leader container via Podman"
+sudo -u "$CONJUR_USER" podman run -d \
+  --name conjur-leader \
+  --hostname "$(hostname -f)" \
+  --security-opt seccomp=/opt/cyberark/conjur/security/seccomp.json \
+  --publish 443:443 \
+  --publish 444:444 \
+  --publish 5432:5432 \
+  --cap-add AUDIT_WRITE \
+  --log-driver journald \
+  --volume /opt/cyberark/conjur/config:/etc/conjur/config:z \
+  --volume /opt/cyberark/conjur/security:/opt/cyberark/conjur/security:z \
+  --volume /opt/cyberark/conjur/backups:/opt/conjur/backup:z \
+  --volume /opt/cyberark/conjur/logs:/var/log/conjur:z \
+  conjur-appliance:"$IMAGE_TAG"
+
+########################################
+# 11) Generate systemd unit & enable linger
+########################################
+
+echo "==> Generating systemd unit for conjur-leader"
+sudo -u "$CONJUR_USER" mkdir -p "$HOME/.config/systemd/user"
+sudo -u "$CONJUR_USER" podman generate systemd --name conjur-leader > "$HOME/.config/systemd/user/conjur.service"
+
+echo "==> Enabling user systemd service and linger"
+sudo -u "$CONJUR_USER" systemctl --user daemon-reload
+sudo -u "$CONJUR_USER" systemctl --user enable conjur.service
+sudo loginctl enable-linger "$CONJUR_USER"
+
+########################################
+# 12) Finished
+########################################
+
 echo
-echo "Conjur is up and running!"
-echo "  URL:  $CONJUR_URL"
-echo "  Admin user:   admin"
-echo "  Admin password: $(docker-compose -f "$COMPOSE_FILE" exec -T conjur-api conjur admin password show)"
-echo
-echo "You can now log in with:"
-echo "  conjur login -u admin -p <password> -a appliance"
+echo "✅  Conjur Enterprise Leader is now running rootless under user '$CONJUR_USER'."
+echo "    Access it at: https://$(hostname -f)"
 echo
